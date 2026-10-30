@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AudioLines, Check, Clock3, Headphones, Mic, MicOff, Send, Sparkles, Square, Volume2, X } from "lucide-react";
+import { AudioLines, Check, Clock3, FileDown, Headphones, Mic, MicOff, Send, Sparkles, Square, Volume2, X } from "lucide-react";
 import { GoogleGenAI, Modality } from "@google/genai";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:3000";
@@ -21,6 +21,8 @@ export default function App() {
   const [muted, setMuted] = useState(false);
   const [showReport, setShowReport] = useState(false);
   const liveSessionRef = useRef(null);
+  const sessionHandleRef = useRef(null);
+  const reconnectingRef = useRef(false);
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
   const sourceRef = useRef(null);
@@ -63,6 +65,8 @@ export default function App() {
     nextPlayTimeRef.current = 0;
     pendingUserTextRef.current = "";
     pendingAssistantTextRef.current = "";
+    sessionHandleRef.current = null;
+    reconnectingRef.current = false;
   }
 
   function downsampleTo16k(floatSamples, inputRate) {
@@ -125,6 +129,122 @@ export default function App() {
     transcriptRef.current = [...transcriptRef.current, { role, text: item.text }].slice(-300);
     setMessages(prev => [...prev, item]);
   }
+  
+  async function connectLiveSession(tokenData, prompt, handle = null) {
+    const ai = new GoogleGenAI({
+      apiKey: tokenData.clientSecret,
+      httpOptions: { apiVersion: "v1alpha" }
+    });
+
+    let session;
+    session = await ai.live.connect({
+      model: tokenData.model || "gemini-3.8-live",
+      config: {
+        responseModalities: [Modality.AUDIO],
+        systemInstruction: prompt,
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        sessionResumption: handle ? { handle } : {},
+        contextWindowCompression: { slidingWindow: {} }
+      },
+      callbacks: {
+        onopen: () => console.log("Gemini Live connected"),
+        onmessage: (message) => {
+          const update = message.sessionResumptionUpdate;
+          if (update?.resumable && update?.newHandle) {
+            sessionHandleRef.current = update.newHandle;
+          }
+
+          if (message.goAway) {
+            console.log("Gemini GoAway received:", message.goAway.timeLeft);
+            void reconnectSession(session);
+          }
+
+          const serverContent = message.serverContent;
+          if (!serverContent) return;
+
+          const inputText = serverContent.inputTranscription?.text;
+          if (inputText) pendingUserTextRef.current += inputText;
+
+          const outputText = serverContent.outputTranscription?.text;
+          if (outputText) pendingAssistantTextRef.current += outputText;
+
+          for (const part of serverContent.modelTurn?.parts || []) {
+            if (part.inlineData?.data && String(part.inlineData.mimeType || "").startsWith("audio/pcm")) {
+              try { playPcmBase64(part.inlineData.data, audioContextRef.current); }
+              catch (err) { console.warn("Could not play audio:", err); }
+            }
+          }
+
+          if (serverContent.interrupted) {
+            nextPlayTimeRef.current = audioContextRef.current?.currentTime || 0;
+          }
+
+          if (serverContent.turnComplete) {
+            const userText = pendingUserTextRef.current.trim();
+            const assistantText = pendingAssistantTextRef.current.trim();
+            if (userText) addMessage("user", userText);
+            if (assistantText) addMessage("assistant", assistantText);
+            pendingUserTextRef.current = "";
+            pendingAssistantTextRef.current = "";
+          }
+        },
+        onerror: (event) => {
+          if (!reconnectingRef.current && !endedRef.current) {
+            setError(event?.message || "Gemini Live connection error.");
+          }
+        },
+        onclose: (event) => {
+          // Ignore old sockets after a replacement connection has been installed.
+          if (liveSessionRef.current !== session || endedRef.current || reconnectingRef.current) return;
+          console.warn("Gemini connection closed:", event?.reason);
+          void reconnectSession(session);
+        }
+      }
+    });
+
+    liveSessionRef.current = session;
+    return session;
+  }
+
+  async function reconnectSession(oldSession) {
+    if (endedRef.current || reconnectingRef.current) return;
+
+    const handle = sessionHandleRef.current;
+    if (!handle) {
+      setError("The voice connection closed before Gemini provided a resumable session handle. Please end this session and start again.");
+      return;
+    }
+
+    reconnectingRef.current = true;
+    setError("Reconnecting your conversation…");
+    try {
+      try { oldSession?.close(); } catch {}
+
+      const tokenRes = await fetch(`${API}/api/realtime/client-secret`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tone, level, topic })
+      });
+      const tokenText = await tokenRes.text();
+      let tokenData = {};
+      try { tokenData = tokenText ? JSON.parse(tokenText) : {}; } catch {}
+      if (!tokenRes.ok || !tokenData.clientSecret) {
+        throw new Error(tokenData.error || `Could not create a reconnect token (server ${tokenRes.status}).`);
+      }
+
+      const prompt = tokenData.systemInstruction || "You are SpeakMate, a friendly English speaking partner. Speak in clear, concise English and ask one question at a time.";
+      await connectLiveSession(tokenData, prompt, handle);
+      reconnectingRef.current = false;
+      setError("");
+      console.log("SpeakMate conversation resumed.");
+    } catch (err) {
+      reconnectingRef.current = false;
+      console.error("Session resume failed:", err);
+      setError(`${err?.message || "Could not resume the voice session."} You can end this session and start a new one.`);
+    }
+  }
+
 
   async function startSession() {
     setError("");
@@ -132,6 +252,10 @@ export default function App() {
     setShowReport(false);
     setMessages([]);
     transcriptRef.current = [];
+    pendingUserTextRef.current = "";
+    pendingAssistantTextRef.current = "";
+    sessionHandleRef.current = null;
+    reconnectingRef.current = false;
     endedRef.current = false;
     setElapsed(0);
     setReportDuration(0);
@@ -149,14 +273,11 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tone, level, topic })
       });
-      const tokenBody = await tokenRes.text();
+      const tokenText = await tokenRes.text();
       let tokenData = {};
-      try { tokenData = tokenBody ? JSON.parse(tokenBody) : {}; } catch {}
-      if (!tokenRes.ok) {
+      try { tokenData = tokenText ? JSON.parse(tokenText) : {}; } catch {}
+      if (!tokenRes.ok || !tokenData.clientSecret) {
         throw new Error(tokenData.error || `Could not create a Gemini session (server ${tokenRes.status}).`);
-      }
-      if (!tokenData.clientSecret) {
-        throw new Error("Backend did not return a Gemini temporary token. Check GEMINI_API_KEY in server/.env.");
       }
 
       const audioContext = new AudioContext({ sampleRate: 24000 });
@@ -168,66 +289,10 @@ export default function App() {
       streamRef.current = stream;
 
       const prompt = tokenData.systemInstruction || "You are SpeakMate, a friendly English speaking partner. Speak in clear, concise English and ask one question at a time.";
-      const ai = new GoogleGenAI({
-        apiKey: tokenData.clientSecret,
-        httpOptions: { apiVersion: "v1alpha" }
-      });
-
-      const session = await ai.live.connect({
-        model: tokenData.model || "gemini-3.8-live",
-        config: {
-          responseModalities: [Modality.AUDIO],
-          systemInstruction: prompt,
-          inputAudioTranscription: {},
-          outputAudioTranscription: {}
-        },
-        callbacks: {
-          onopen: () => {},
-          onmessage: (message) => {
-            const serverContent = message.serverContent;
-            if (!serverContent) return;
-
-            const inputText = serverContent.inputTranscription?.text;
-            if (inputText) pendingUserTextRef.current += inputText;
-
-            const outputText = serverContent.outputTranscription?.text;
-            if (outputText) pendingAssistantTextRef.current += outputText;
-
-            const parts = serverContent.modelTurn?.parts || [];
-            for (const part of parts) {
-              if (part.inlineData?.data && String(part.inlineData.mimeType || "").startsWith("audio/pcm")) {
-                try { playPcmBase64(part.inlineData.data, audioContextRef.current); }
-                catch (err) { console.warn("Could not play an audio chunk:", err); }
-              }
-            }
-
-            if (serverContent.interrupted) {
-              nextPlayTimeRef.current = audioContextRef.current?.currentTime || 0;
-            }
-
-            if (serverContent.turnComplete) {
-              const userText = pendingUserTextRef.current.trim();
-              const assistantText = pendingAssistantTextRef.current.trim();
-              if (userText) addMessage("user", userText);
-              if (assistantText) addMessage("assistant", assistantText);
-              pendingUserTextRef.current = "";
-              pendingAssistantTextRef.current = "";
-            }
-          },
-          onerror: (event) => {
-            const message = event?.message || "Gemini Live connection error.";
-            setError(message);
-          },
-          onclose: (event) => {
-            if (!endedRef.current) {
-              setError(event?.reason ? `Gemini connection closed: ${event.reason}` : "Gemini voice connection closed. Start a new session to reconnect.");
-            }
-          }
-        }
-      });
-      liveSessionRef.current = session;
+      const session = await connectLiveSession(tokenData, prompt);
       startedAtRef.current = Date.now();
       setStatus("active");
+
       session.sendClientContent({
         turns: [{ role: "user", parts: [{ text: `Start our English practice about ${topic}. Greet me warmly and ask one easy opening question. Remember my level is ${level} and style is ${tone}.` }] }],
         turnComplete: true
@@ -240,7 +305,7 @@ export default function App() {
       processor.onaudioprocess = (event) => {
         const output = event.outputBuffer.getChannelData(0);
         output.fill(0);
-        if (mutedRef.current || !liveSessionRef.current) return;
+        if (mutedRef.current || reconnectingRef.current || !liveSessionRef.current || endedRef.current) return;
         try {
           const pcm = downsampleTo16k(event.inputBuffer.getChannelData(0), audioContext.sampleRate);
           liveSessionRef.current.sendRealtimeInput({
@@ -248,22 +313,23 @@ export default function App() {
           });
         } catch (err) {
           console.error("Could not stream microphone audio:", err);
-          setError("Microphone audio could not be sent. Please restart the session.");
+          setError("Microphone audio could not be sent. Please check your connection.");
         }
       };
       source.connect(processor);
       processor.connect(audioContext.destination);
-    } catch (e) {
+    } catch (err) {
+      endedRef.current = true;
       cleanupConnection();
       setStatus("idle");
-      setError(e?.message || "Could not start. Check microphone permission and the backend server.");
+      setError(err?.message || "Could not start. Check microphone permission and the backend server.");
     }
   }
 
   function sendText(e) {
     e?.preventDefault();
     const text = draft.trim();
-    if (!text || status !== "active" || !liveSessionRef.current) return;
+    if (!text || status !== "active" || reconnectingRef.current || !liveSessionRef.current) return;
     addMessage("user", text);
     try {
       liveSessionRef.current.sendClientContent({
@@ -291,13 +357,20 @@ export default function App() {
     setElapsed(total);
     setReportDuration(total);
     setStatus("finished");
+    // Preserve any final partial transcription before closing the connection.
+    const finalUserText = pendingUserTextRef.current.trim();
+    const finalAssistantText = pendingAssistantTextRef.current.trim();
+    if (finalUserText) addMessage("user", finalUserText);
+    if (finalAssistantText) addMessage("assistant", finalAssistantText);
+    pendingUserTextRef.current = "";
+    pendingAssistantTextRef.current = "";
     cleanupConnection();
     setReportLoading(true);
     setShowReport(true);
     try {
       const response = await fetch(`${API}/api/report`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: transcriptRef.current, durationSeconds: total, level })
+        body: JSON.stringify({ transcript: transcriptRef.current, durationSeconds: total, level, tone, topic })
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not generate report.");
@@ -377,29 +450,119 @@ export default function App() {
   </div>;
 }
 
+function safeScore(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.min(100, Math.round(number))) : null;
+}
+
+function downloadReportPdf(report, duration) {
+  // Uses the browser's native Print > Save as PDF flow; no extra package required.
+  const escapeHtml = (value) => String(value ?? "").replace(/[&<>\"]/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '\"': "&quot;"
+  }[char]));
+  const list = (items, render) => Array.isArray(items) && items.length
+    ? items.map((item) => `<article>${render(item)}</article>`).join("")
+    : "<p>No specific feedback was available in this section.</p>";
+
+  const grammar = report.grammar || report.grammarMistakes || [];
+  const alternatives = report.sentenceAlternatives || report.betterSentences || report.alternativeSentences || [];
+  const words = report.newWords || report.vocabularyWords || report.wordsToLearn || [];
+  const strengths = report.strengths || [];
+  const goals = report.practiceGoals || report.nextSessionSuggestions || report.suggestions || [];
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>SpeakMate Speaking Report</title>
+  <style>body{font:15px Arial,sans-serif;color:#172033;max-width:850px;margin:35px auto;padding:0 24px;line-height:1.55}h1,h2{color:#172033}h2{margin-top:28px;border-bottom:1px solid #ddd;padding-bottom:7px}.scores{display:flex;gap:14px;flex-wrap:wrap}.score{border:1px solid #ddd;border-radius:10px;padding:14px;min-width:130px}.score b{display:block;font-size:26px}.item{border:1px solid #e2e5eb;border-radius:9px;padding:12px;margin:10px 0;break-inside:avoid}.muted{color:#596579;font-size:13px}.label{font-size:11px;font-weight:bold;color:#657187}.good{color:#087c55}.word{font-weight:bold;font-size:17px}@media print{body{margin:12mm auto;padding:0}.item{break-inside:avoid}button{display:none}}</style></head><body>
+  <h1>SpeakMate — Personal Speaking Report</h1><p class="muted">Session duration: ${Math.floor(duration/60)} min ${duration%60} sec · Level: ${escapeHtml(report.level || "Not specified")}</p>
+  <p>${escapeHtml(report.summary || "Your personalised English speaking feedback.")}</p>
+  <div class="scores">${[["Grammar",report.grammarScore], ["Fluency",report.fluencyScore], ["Vocabulary",report.vocabularyScore]].map(([label,val])=>`<div class="score"><span>${label}</span><b>${safeScore(val) ?? "—"}/100</b></div>`).join("")}</div>
+  <h2>Grammar corrections</h2>${list(grammar,g=>`<div class="label">YOU SAID</div><p>${escapeHtml(g.original || g.incorrect || "")}</p><div class="label good">CORRECTED</div><p>${escapeHtml(g.corrected || g.correction || "")}</p><p class="muted">${escapeHtml(g.explanation || "")}</p>`)}
+  <h2>Better sentences you could have used</h2>${list(alternatives,a=>`<div class="label">YOUR SENTENCE</div><p>${escapeHtml(a.original || a.userSentence || "")}</p><div class="label good">A MORE NATURAL ALTERNATIVE</div><p>${escapeHtml(a.alternative || a.better || a.suggestedSentence || "")}</p><p class="muted">${escapeHtml(a.reason || a.context || "")}</p>`)}
+  <h2>10 useful words from your conversation</h2>${list(words,w=>`<p class="word">${escapeHtml(w.word || w.term || "")}</p><p>${escapeHtml(w.meaning || w.definition || "")}</p><p class="muted">Example: ${escapeHtml(w.example || w.exampleSentence || "")}</p>`)}
+  <h2>What went well</h2>${list(strengths,s=>`<p>${escapeHtml(typeof s === "string" ? s : s.feedback || s.text || "")}</p>`)}
+  <h2>Suggestions for your next conversation</h2>${list(goals,g=>`<p>${escapeHtml(typeof g === "string" ? g : g.suggestion || g.text || g.feedback || "")}</p>`)}
+  <p class="muted">AI-generated learning feedback based on the available transcript. Scores are estimates, not a certified language assessment.</p>
+  <script>window.onload=()=>window.print();</script></body></html>`;
+
+  const printWindow = window.open("", "_blank", "width=900,height=700");
+  if (!printWindow) {
+    alert("Please allow pop-ups for SpeakMate to save your report as PDF.");
+    return;
+  }
+  printWindow.document.open();
+  printWindow.document.write(html);
+  printWindow.document.close();
+}
+
+function ScoreCard({ label, value, note }) {
+  const score = safeScore(value);
+  return <div className="score-card">
+    <span>{label}</span>
+    <strong>{score === null ? "—" : score}<small>/100</small></strong>
+    {score !== null && <div className="score-track"><span style={{ width: `${score}%` }} /></div>}
+    {note && <p>{note}</p>}
+  </div>;
+}
+
 function Report({ report, duration, onClose }) {
-  const score = Math.max(0, Math.min(100, Number(report.fluencyScore) || 0));
+  const grammar = report.grammar || report.grammarMistakes || [];
+  const alternatives = report.sentenceAlternatives || report.betterSentences || report.alternativeSentences || [];
+  const words = report.newWords || report.vocabularyWords || report.wordsToLearn || [];
+  const strengths = report.strengths || [];
+  const goals = report.practiceGoals || report.nextSessionSuggestions || report.suggestions || [];
   const speakTime = Number(report.estimatedSpeakingSeconds) || 0;
+
   return <div className="report-content">
     <div className="report-topline"><span className="report-badge"><Sparkles size={14}/> SESSION COMPLETE</span><span className="report-date">YOUR DAILY REPORT</span></div>
-    <h2 id="report-title">Look at you, showing up! 🎉</h2><p className="report-intro">{report.summary || "Nice work finishing your practice session."}</p>
+    <h2 id="report-title">Your personal speaking feedback</h2>
+    <p className="report-intro">{report.summary || "Your conversation has been reviewed. Here are practical ways to express yourself more naturally next time."}</p>
+
     <div className="score-grid">
-      <div className="score-card"><span>FLUENCY SCORE</span><strong>{score}<small>/100</small></strong><div className="score-track"><span style={{width:`${score}%`}}/></div></div>
+      <ScoreCard label="GRAMMAR SCORE" value={report.grammarScore} />
+      <ScoreCard label="FLUENCY SCORE" value={report.fluencyScore} note="Estimated from transcript flow and sentence formation" />
+      <ScoreCard label="VOCABULARY SCORE" value={report.vocabularyScore} note="Estimated from word variety and usage" />
+    </div>
+    <div className="score-grid">
       <div className="score-card"><span>EST. SPEAKING TIME</span><strong>{Math.floor(speakTime/60)}<small>m</small> {speakTime%60}<small>s</small></strong><p>Estimated from your transcript</p></div>
       <div className="score-card"><span>SESSION LENGTH</span><strong>{Math.floor(duration/60)}<small>m</small> {duration%60}<small>s</small></strong><p>Time spent practicing</p></div>
     </div>
-    <ReportSection title="Grammar tune-up" subtitle="Small changes that make your English clearer" empty="No clear grammar errors found in the available transcript." items={report.grammar} render={g => <div className="feedback-item"><div className="before"><span>YOU SAID</span><p>{g.original}</p></div><div className="after"><span>TRY THIS</span><p>{g.corrected}</p></div>{g.explanation && <p className="explanation">{g.explanation}</p>}</div>}/>
-    <ReportSection title="Level up your vocabulary" subtitle="Alternative phrases to try next time" empty="Keep exploring new words and expressions!" items={report.vocabulary} render={v => <div className="vocab-item"><div><span className="word-chip">{v.used}</span><span className="word-arrow">→</span><span className="word-chip better">{v.suggestion}</span></div><p>{v.why}</p></div>}/>
-    <ReportSection title="What went well" items={report.strengths} empty="You completed a practice session — that is a win." render={s => <div className="simple-item"><Check size={16}/><span>{s}</span></div>}/>
-    <ReportSection title="Your next mini-goals" items={report.practiceGoals} empty="Try to speak a little longer next time." render={g => <div className="goal-item"><span className="goal-dot"/><span>{g}</span></div>}/>
+
+    <ReportSection title="Grammar corrections" subtitle="Your actual mistakes, corrected with a short explanation" empty="No clear grammar errors were identified in the available transcript." items={grammar} render={g => <div className="feedback-item">
+      <div className="before"><span>YOU SAID</span><p>{g.original || g.incorrect || ""}</p></div>
+      <div className="after"><span>CORRECTED SENTENCE</span><p>{g.corrected || g.correction || ""}</p></div>
+      {g.explanation && <p className="explanation">{g.explanation}</p>}
+      {g.rule && <p className="explanation"><b>Grammar point:</b> {g.rule}</p>}
+    </div>} />
+
+    <ReportSection title="A better way to say it" subtitle="Alternatives you could have used instead of your original sentence in this conversation" empty="No clear sentence alternatives were available for this conversation." items={alternatives} render={a => <div className="feedback-item">
+      <div className="before"><span>YOUR SENTENCE</span><p>{a.original || a.userSentence || ""}</p></div>
+      <div className="after"><span>YOU COULD HAVE SAID</span><p>{a.alternative || a.better || a.suggestedSentence || ""}</p></div>
+      {(a.reason || a.context) && <p className="explanation">{a.reason || a.context}</p>}
+    </div>} />
+
+    <ReportSection title="10 useful words for your next conversation" subtitle="Words selected from the topics and ideas you discussed, with meanings in English" empty="No additional vocabulary suggestions were returned." items={words} render={w => <div className="vocab-item">
+      <div><span className="word-chip better">{w.word || w.term || "Word"}</span></div>
+      <p><b>Meaning:</b> {w.meaning || w.definition || "Meaning not provided."}</p>
+      {(w.example || w.exampleSentence) && <p><b>Example:</b> {w.example || w.exampleSentence}</p>}
+    </div>} />
+
+    <ReportSection title="What went well" items={strengths} empty="You completed a speaking session. Keep building on that consistency." render={item => <div className="simple-item"><Check size={16}/><span>{typeof item === "string" ? item : item.feedback || item.text || ""}</span></div>} />
+    <ReportSection title="Suggestions for your next conversation" subtitle="Specific things to focus on based on this session" items={goals} empty="Keep speaking regularly and focus on expressing complete thoughts." render={item => <div className="goal-item"><span className="goal-dot"/><span>{typeof item === "string" ? item : item.suggestion || item.text || item.feedback || ""}</span></div>} />
+
     <div className="encouragement"><Sparkles size={19}/><p>{report.encouragement || "Keep going — confidence grows one conversation at a time."}</p></div>
-    <p className="report-disclaimer">This is an AI-generated learning aid based on the available transcript, not a certified language assessment. Speaking time is an estimate.</p>
-    <button className="start-button report-done" onClick={onClose}><Check size={18}/> Done for today</button>
+    <p className="report-disclaimer">This AI-generated learning aid is based on the available transcript. Fluency and vocabulary scores are estimates, not certified language assessments. Pronunciation is not scored from text alone.</p>
+    <div className="report-actions">
+      <button className="start-button" onClick={() => downloadReportPdf(report, duration)}><FileDown size={18}/> Download PDF</button>
+      <button className="start-button report-done" onClick={onClose}><Check size={18}/> Done for today</button>
+    </div>
   </div>;
 }
 
 function ReportSection({ title, subtitle, items = [], empty, render }) {
-  return <section className="report-section"><h3>{title}</h3>{subtitle && <p className="section-subtitle">{subtitle}</p>}
-    {Array.isArray(items) && items.length ? <div className="feedback-list">{items.slice(0, 8).map((item, i) => <div key={i}>{render(item)}</div>)}</div> : <p className="empty-feedback">{empty}</p>}
+  return <section className="report-section">
+    <h3>{title}</h3>
+    {subtitle && <p className="section-subtitle">{subtitle}</p>}
+    {Array.isArray(items) && items.length
+      ? <div className="feedback-list">{items.map((item, index) => <div key={index}>{render(item)}</div>)}</div>
+      : <p className="empty-feedback">{empty}</p>}
   </section>;
 }
