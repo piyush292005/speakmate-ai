@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { AudioLines, Check, Clock3, FileDown, Headphones, Mic, MicOff, Send, Sparkles, Square, Volume2, X } from "lucide-react";
-import "./App.css";
+
 
 import { GoogleGenAI, Modality } from "@google/genai";
 
